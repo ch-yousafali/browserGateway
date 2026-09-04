@@ -1,0 +1,270 @@
+name: cloakbrowser-fleet
+version: 1
+
+services:
+  cloak-profile-01:
+    image: docker.io/library/cloakbrowser:151-poc-v2
+    resources:
+      vcpus: 1
+      memory: 1GB
+    env:
+      HOME: /home/clawbrowser
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -e
+        Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp -noreset +extension RANDR &
+        for i in $(seq 1 40); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.25; done
+        socat TCP-LISTEN:9223,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:9222 &
+        export DISPLAY=:99
+        export HOME=/home/clawbrowser
+        exec /opt/clawbrowser/clawbrowser.real \
+          --no-sandbox \
+          --no-first-run \
+          --no-default-browser-check \
+          --disable-dev-shm-usage \
+          --remote-debugging-port=9222 \
+          --remote-debugging-address=127.0.0.1 \
+          --remote-allow-origins=* \
+          --user-data-dir=/home/clawbrowser/profile \
+          --window-size=1920,1080 \
+          about:blank
+    volumes:
+      - volume: cloak-data-01
+        mount_path: /home/clawbrowser/.config/clawbrowser
+    healthcheck:
+      type: http
+      http:
+        port: 9223
+        path: /json/version
+        scheme: http
+        expected_status: 200
+      interval: 10s
+      timeout: 5s
+      start_period: 40s
+      failure_threshold: 5
+    restart:
+      policy: on_failure
+      backoff: 5s
+    ingress:
+      - hostname: localhost
+        host_port: 9301
+        target_port: 9223
+
+  cloak-profile-02:
+    image: docker.io/library/cloakbrowser:151-poc-v2
+    resources:
+      vcpus: 1
+      memory: 1GB
+    env:
+      HOME: /home/clawbrowser
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -e
+        Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp -noreset +extension RANDR &
+        for i in $(seq 1 40); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.25; done
+        socat TCP-LISTEN:9223,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:9222 &
+        export DISPLAY=:99
+        export HOME=/home/clawbrowser
+        exec /opt/clawbrowser/clawbrowser.real \
+          --no-sandbox \
+          --no-first-run \
+          --no-default-browser-check \
+          --disable-dev-shm-usage \
+          --remote-debugging-port=9222 \
+          --remote-debugging-address=127.0.0.1 \
+          --remote-allow-origins=* \
+          --user-data-dir=/home/clawbrowser/profile \
+          --window-size=1920,1080 \
+          about:blank
+    volumes:
+      - volume: cloak-data-02
+        mount_path: /home/clawbrowser/.config/clawbrowser
+    healthcheck:
+      type: http
+      http:
+        port: 9223
+        path: /json/version
+        scheme: http
+        expected_status: 200
+      interval: 10s
+      timeout: 5s
+      start_period: 40s
+      failure_threshold: 5
+    restart:
+      policy: on_failure
+      backoff: 5s
+    ingress:
+      - hostname: localhost
+        host_port: 9302
+        target_port: 9223
+
+  cloak-profile-03:
+    image: docker.io/library/cloakbrowser:151-poc-v2
+    resources:
+      vcpus: 1
+      memory: 1GB
+    env:
+      HOME: /home/clawbrowser
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -e
+        Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp -noreset +extension RANDR &
+        for i in $(seq 1 40); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.25; done
+        socat TCP-LISTEN:9223,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:9222 &
+        export DISPLAY=:99
+        export HOME=/home/clawbrowser
+        exec /opt/clawbrowser/clawbrowser.real \
+          --no-sandbox \
+          --no-first-run \
+          --no-default-browser-check \
+          --disable-dev-shm-usage \
+          --remote-debugging-port=9222 \
+          --remote-debugging-address=127.0.0.1 \
+          --remote-allow-origins=* \
+          --user-data-dir=/home/clawbrowser/profile \
+          --window-size=1920,1080 \
+          about:blank
+    volumes:
+      - volume: cloak-data-03
+        mount_path: /home/clawbrowser/.config/clawbrowser
+    healthcheck:
+      type: http
+      http:
+        port: 9223
+        path: /json/version
+        scheme: http
+        expected_status: 200
+      interval: 10s
+      timeout: 5s
+      start_period: 40s
+      failure_threshold: 5
+    restart:
+      policy: on_failure
+      backoff: 5s
+    ingress:
+      - hostname: localhost
+        host_port: 9303
+        target_port: 9223
+
+  cloak-profile-04:
+    image: docker.io/library/cloakbrowser:151-poc-v2
+    resources:
+      vcpus: 1
+      memory: 1GB
+    env:
+      HOME: /home/clawbrowser
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -e
+        Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp -noreset +extension RANDR &
+        for i in $(seq 1 40); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.25; done
+        socat TCP-LISTEN:9223,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:9222 &
+        export DISPLAY=:99
+        export HOME=/home/clawbrowser
+        exec /opt/clawbrowser/clawbrowser.real \
+          --no-sandbox \
+          --no-first-run \
+          --no-default-browser-check \
+          --disable-dev-shm-usage \
+          --remote-debugging-port=9222 \
+          --remote-debugging-address=127.0.0.1 \
+          --remote-allow-origins=* \
+          --user-data-dir=/home/clawbrowser/profile \
+          --window-size=1920,1080 \
+          about:blank
+    volumes:
+      - volume: cloak-data-04
+        mount_path: /home/clawbrowser/.config/clawbrowser
+    healthcheck:
+      type: http
+      http:
+        port: 9223
+        path: /json/version
+        scheme: http
+        expected_status: 200
+      interval: 10s
+      timeout: 5s
+      start_period: 40s
+      failure_threshold: 5
+    restart:
+      policy: on_failure
+      backoff: 5s
+    ingress:
+      - hostname: localhost
+        host_port: 9304
+        target_port: 9223
+
+  cloak-profile-05:
+    image: docker.io/library/cloakbrowser:151-poc-v2
+    resources:
+      vcpus: 1
+      memory: 1GB
+    env:
+      HOME: /home/clawbrowser
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -e
+        Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp -noreset +extension RANDR &
+        for i in $(seq 1 40); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.25; done
+        socat TCP-LISTEN:9223,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:9222 &
+        export DISPLAY=:99
+        export HOME=/home/clawbrowser
+        exec /opt/clawbrowser/clawbrowser.real \
+          --no-sandbox \
+          --no-first-run \
+          --no-default-browser-check \
+          --disable-dev-shm-usage \
+          --remote-debugging-port=9222 \
+          --remote-debugging-address=127.0.0.1 \
+          --remote-allow-origins=* \
+          --user-data-dir=/home/clawbrowser/profile \
+          --window-size=1920,1080 \
+          about:blank
+    volumes:
+      - volume: cloak-data-05
+        mount_path: /home/clawbrowser/.config/clawbrowser
+    healthcheck:
+      type: http
+      http:
+        port: 9223
+        path: /json/version
+        scheme: http
+        expected_status: 200
+      interval: 10s
+      timeout: 5s
+      start_period: 40s
+      failure_threshold: 5
+    restart:
+      policy: on_failure
+      backoff: 5s
+    ingress:
+      - hostname: localhost
+        host_port: 9305
+        target_port: 9223
+
+volumes:
+  cloak-data-01:
+    name: cloak-data-01
+    size_gb: 5
+  cloak-data-02:
+    name: cloak-data-02
+    size_gb: 5
+  cloak-data-03:
+    name: cloak-data-03
+    size_gb: 5
+  cloak-data-04:
+    name: cloak-data-04
+    size_gb: 5
+  cloak-data-05:
+    name: cloak-data-05
+    size_gb: 5

@@ -1,0 +1,82 @@
+version: 1
+gateway:
+  port: 9500
+  defaultStrategy: round-robin
+  connectionTimeout: 10000
+  healthCheckInterval: 30000
+  cooldown:
+    defaultMs: 30000
+    failureThreshold: 0.5
+    minRequestVolume: 3
+  sessions:
+    idleTimeoutMs: 300000
+    reconnectTimeoutMs: 300000
+
+# ──────────────────────────────────────────────────────────────
+# 5 CloakBrowser profiles — each is an isolated Chrome 151 VM
+# deployed via Hypeman with its own persistent volume.
+#
+# Each CloakBrowser VM is an external CDP provider. For write-back
+# profiles, pin one VM to one profile via the `profile:` field or
+# from the dashboard's Providers page.
+#
+# Instance IPs change on recreate. After `hypeman compose up --replace`,
+# update the URLs below with new IPs (see fleet.sh).
+# ──────────────────────────────────────────────────────────────
+providers:
+  cloak-profile-01:
+    url: http://10.100.148.49:9223
+    limits:
+      maxConcurrent: 3
+    priority: 1
+
+  cloak-profile-02:
+    url: http://10.100.171.247:9223
+    limits:
+      maxConcurrent: 3
+    priority: 1
+
+  cloak-profile-03:
+    url: http://10.100.141.195:9223
+    limits:
+      maxConcurrent: 3
+    priority: 1
+
+  cloak-profile-04:
+    url: http://10.100.79.121:9223
+    limits:
+      maxConcurrent: 3
+    priority: 1
+
+  cloak-profile-05:
+    url: http://10.100.48.105:9223
+    limits:
+      maxConcurrent: 3
+    priority: 1
+
+dashboard:
+  enabled: true
+logging:
+  level: info
+
+profiles:
+  enabled: true
+  store: filesystem
+  filesystem:
+    path: ./profiles
+  encryption:
+    keyEnv: BG_ENCRYPTION_KEY
+  lockTtlMs: 300000
+  cdpTimeoutMs: 10000
+  commitTimeoutMs: 4000
+
+replay:
+  store: filesystem
+  filesystem:
+    path: ./replays
+  retentionDays: 7
+  maxBytesPerSession: 524288000
+  capture:
+    format: jpeg
+    quality: 70
+    everyNthFrame: 1

@@ -1,0 +1,58 @@
+version: 1
+gateway:
+  port: 9500
+  defaultStrategy: round-robin
+  connectionTimeout: 10000
+  healthCheckInterval: 30000
+  cooldown:
+    defaultMs: 30000
+    failureThreshold: 0.5
+    minRequestVolume: 3
+  sessions:
+    idleTimeoutMs: 300000
+    reconnectTimeoutMs: 300000
+providers:
+  cloak-profile-01:
+    url: http://10.100.148.49:9223
+    limits:
+      maxConcurrent: 3
+  cloak-profile-02:
+    url: http://10.100.171.247:9223
+    limits:
+      maxConcurrent: 3
+  cloak-profile-03:
+    url: http://10.100.141.195:9223
+    limits:
+      maxConcurrent: 3
+  cloak-profile-04:
+    url: http://10.100.79.121:9223
+    limits:
+      maxConcurrent: 3
+  cloak-profile-05:
+    url: http://10.100.48.105:9223
+    limits:
+      maxConcurrent: 3
+dashboard:
+  enabled: true
+logging:
+  level: info
+profiles:
+  enabled: true
+  store: filesystem
+  filesystem:
+    path: ./profiles
+  encryption:
+    keyEnv: BG_ENCRYPTION_KEY
+  lockTtlMs: 300000
+  cdpTimeoutMs: 10000
+  commitTimeoutMs: 4000
+replay:
+  store: filesystem
+  filesystem:
+    path: ./replays
+  retentionDays: 7
+  maxBytesPerSession: 524288000
+  capture:
+    format: jpeg
+    quality: 70
+    everyNthFrame: 1

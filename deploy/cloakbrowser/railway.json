@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.railway.app/railway.v2.json",
+  "deploy": {
+    "healthcheck": {
+      "path": "/json/version",
+      "timeoutSeconds": 5,
+      "gracePeriodSeconds": 40
+    },
+    "restartPolicy": {
+      "maxRetries": 5,
+      "sleepApplication": false
+    },
+    "replicas": 1,
+    "sleepApplication": false
+  }
+}

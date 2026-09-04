@@ -1,0 +1,51 @@
+# Browser Gateway config for Railway.
+#
+# Starts with NO providers. The CloakBrowser provider is registered on demand
+# by `POST /v1/browser/launch` (or `GET`), which reads BG_CLOAKBROWSER_CDP_URL
+# from the environment, verifies the browser is live over CDP, and adds it as
+# the `cloakbrowser` provider. After that, ws://<gateway>/v1/connect routes to
+# it and the REST/MCP APIs drive it like any other provider.
+#
+# Required Railway variables:
+#   BG_TOKEN            — auth token for API/dashboard (openssl rand -base64 32)
+#   BG_ENCRYPTION_KEY   — 256-bit key for profiles (openssl rand -base64 32)
+#   BG_CLOAKBROWSER_CDP_URL — public URL of the standalone CloakBrowser service
+#   BG_DATA_DIR         — /data (mounted volume)
+version: 1
+gateway:
+  port: ${PORT:-9500}
+  defaultStrategy: round-robin
+  connectionTimeout: 10000
+  healthCheckInterval: 30000
+  cooldown:
+    defaultMs: 30000
+    failureThreshold: 0.5
+    minRequestVolume: 3
+  sessions:
+    idleTimeoutMs: 300000
+    reconnectTimeoutMs: 300000
+providers: {}
+dashboard:
+  enabled: true
+logging:
+  level: info
+profiles:
+  enabled: true
+  store: filesystem
+  filesystem:
+    path: ${BG_DATA_DIR}/profiles
+  encryption:
+    keyEnv: BG_ENCRYPTION_KEY
+  lockTtlMs: 300000
+  cdpTimeoutMs: 10000
+  commitTimeoutMs: 4000
+replay:
+  store: filesystem
+  filesystem:
+    path: ${BG_DATA_DIR}/replays
+  retentionDays: 7
+  maxBytesPerSession: 524288000
+  capture:
+    format: jpeg
+    quality: 70
+    everyNthFrame: 1

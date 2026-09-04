@@ -1,0 +1,4 @@
+.bg-data/
+*.png
+__pycache__/
+browser-gateway/
