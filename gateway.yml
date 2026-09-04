@@ -32,6 +32,8 @@ providers:
     url: http://10.100.48.105:9223
     limits:
       maxConcurrent: 3
+  cloakbrowser:
+    url: http://10.100.148.49:9223
 dashboard:
   enabled: true
 logging:
