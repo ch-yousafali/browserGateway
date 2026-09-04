@@ -1,0 +1,819 @@
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { bodyLimit } from "hono/body-limit";
+import { timingSafeEqual, createHmac, randomBytes } from "node:crypto";
+import { readFileSync, writeFileSync, copyFileSync, existsSync } from "node:fs";
+import { join, extname } from "node:path";
+import { probeWebSocket } from "./ws/probe.js";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { isHttpUrl, fetchCdpVersion } from "../core/providers/cdp.js";
+import { probeProviderCapabilities } from "../core/providers/capabilities.js";
+import { writeConfig } from "./config/writer.js";
+import { parseProviderConfigBody, parseWebhookBody, parseYamlGatewayConfig } from "./validation.js";
+import { loadedConfigPath } from "./config/loader.js";
+import { createRestRoutes } from "./rest/index.js";
+import { createDisabledProfileRoutes, createProfileRoutes } from "./rest/profiles.js";
+import { createReplayRoutes } from "./rest/replays.js";
+import { getEffectiveHost, getEffectiveProtocol, parseAllowedOrigins } from "./util/request.js";
+import { securityHeaders } from "./middleware/security-headers.js";
+/** YAML config size cap — prevents oversize POST/PUT to /v1/config from DoS-ing the YAML parser. */
+const MAX_CONFIG_YAML_BYTES = 1024 * 1024;
+/**
+ * Mask query-string credentials inside provider URLs. Targets the param names
+ * that show up in real-world CDP / Playwright provider URLs (`token`, `apiKey`,
+ * `access_token`, `key`, `password`). Used by `GET /v1/config` so the YAML
+ * returned to non-cookie callers can't be used to harvest provider tokens.
+ */
+function redactProviderUrlsInYaml(yaml) {
+    const PARAMS = /([?&](?:token|apikey|api_key|access_token|key|password|secret)=)([^&\s"']+)/gi;
+    return yaml.replace(PARAMS, "$1***");
+}
+function getPackageVersion() {
+    try {
+        const pkg = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../package.json"), "utf-8"));
+        return pkg.version;
+    }
+    catch {
+        return "0.0.0";
+    }
+}
+function safeTokenCompare(a, b) {
+    if (a.length !== b.length)
+        return false;
+    return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+const MIME_TYPES = {
+    ".html": "text/html",
+    ".js": "application/javascript",
+    ".css": "text/css",
+    ".json": "application/json",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".txt": "text/plain",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+};
+const COOKIE_NAME = "bg_session";
+const SESSION_MAX_AGE = 60 * 60 * 24 * 30; // 30 days in seconds
+function getSessionSecret(token) {
+    if (token) {
+        return createHmac("sha256", "bg-session-secret").update(token).digest("hex");
+    }
+    return randomBytes(32).toString("hex");
+}
+function signSession(secret) {
+    const payload = Buffer.from(JSON.stringify({ a: true, t: Date.now() })).toString("base64url");
+    const sig = createHmac("sha256", secret).update(payload).digest("base64url");
+    return `${payload}.${sig}`;
+}
+function verifySession(cookie, secret) {
+    const [payload, sig] = cookie.split(".");
+    if (!payload || !sig)
+        return false;
+    const expected = createHmac("sha256", secret).update(payload).digest("base64url");
+    if (sig.length !== expected.length)
+        return false;
+    return timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+}
+function getCookie(header, name) {
+    if (!header)
+        return undefined;
+    const match = header.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
+    return match?.[1];
+}
+function isAuthenticated(c, token, sessionSecret) {
+    const cookie = getCookie(c.req.header("cookie"), COOKIE_NAME);
+    if (cookie && verifySession(cookie, sessionSecret))
+        return true;
+    const reqToken = c.req.query("token") ??
+        (c.req.header("authorization")?.startsWith("Bearer ")
+            ? c.req.header("authorization").slice(7)
+            : undefined);
+    if (reqToken && safeTokenCompare(reqToken, token))
+        return true;
+    return false;
+}
+/**
+ * Persists the config to disk. On failure, runs `rollback` to undo the caller's
+ * in-memory change and returns a 500 body; returns null on success.
+ */
+function persistConfigOrRollback(config, rollback) {
+    try {
+        writeConfig(config);
+        return null;
+    }
+    catch (err) {
+        rollback();
+        return { error: "Cannot persist to disk", details: [err instanceof Error ? err.message : String(err)] };
+    }
+}
+export function createApp(gateway, token, webDir, logger, pool, profile, profileBootstrapError, replayStore, dataDir, reconnectRegistry) {
+    const app = new Hono();
+    const sessionSecret = getSessionSecret(token);
+    // Security headers on every response (HSTS, nosniff, X-Frame-Options, etc.).
+    app.use("*", securityHeaders());
+    // CORS allowlist. Default: same-origin only (no Access-Control-Allow-Origin
+    // header). Set `BG_ALLOWED_ORIGINS=https://a.example,https://b.example` to
+    // enable cross-origin browsers explicitly. Never wildcard with credentials.
+    const allowedOrigins = parseAllowedOrigins(process.env.BG_ALLOWED_ORIGINS);
+    if (allowedOrigins.size > 0) {
+        app.use("*", cors({
+            origin: (origin) => (origin && allowedOrigins.has(origin.toLowerCase()) ? origin : null),
+            credentials: true,
+        }));
+    }
+    app.get("/health", (c) => {
+        return c.json({ status: "ok", timestamp: new Date().toISOString() });
+    });
+    app.get("/json/version", (c) => {
+        const host = getEffectiveHost(c);
+        const protocol = getEffectiveProtocol(c) === "https" ? "wss" : "ws";
+        const tokenParam = c.req.query("token");
+        const wsUrl = `${protocol}://${host}/v1/connect${tokenParam ? `?token=${tokenParam}` : ""}`;
+        return c.json({
+            Browser: `browser-gateway/${getPackageVersion()}`,
+            "Protocol-Version": "1.3",
+            webSocketDebuggerUrl: wsUrl,
+        });
+    });
+    app.get("/json/version/", (c) => {
+        return c.redirect("/json/version");
+    });
+    app.use("/v1/*", async (c, next) => {
+        if (!token)
+            return next();
+        if (isAuthenticated(c, token, sessionSecret))
+            return next();
+        return c.json({ error: "Unauthorized" }, 401);
+    });
+    /**
+     * Returns the configured BG_TOKEN only to dashboard callers that present
+     * the `bg_session` cookie. Bearer callers get `authEnabled: true` without
+     * the token — they already know it, and refusing to echo it limits the
+     * blast radius of any future API leak (proxy logs, accidental forwarding).
+     */
+    app.get("/v1/auth/info", (c) => {
+        if (!token)
+            return c.json({ token: null, authEnabled: false });
+        const cookie = getCookie(c.req.header("cookie"), COOKIE_NAME);
+        const cookieAuth = !!(cookie && verifySession(cookie, sessionSecret));
+        return c.json({ token: cookieAuth ? token : null, authEnabled: true });
+    });
+    app.get("/v1/status", (c) => {
+        const status = gateway.getStatus();
+        const providers = status.providers.map((b) => ({
+            id: b.id,
+            healthy: b.healthy,
+            active: b.active,
+            maxConcurrent: b.config.limits?.maxConcurrent ?? b.discoveredMaxConcurrent ?? null,
+            maxConcurrentSource: b.config.limits?.maxConcurrent
+                ? "config"
+                : b.discoveredMaxConcurrent
+                    ? "discovered"
+                    : null,
+            detectedKind: b.detectedKind,
+            cooldownUntil: b.cooldownUntil
+                ? new Date(b.cooldownUntil).toISOString()
+                : null,
+            avgLatencyMs: Math.round(b.avgLatencyMs),
+            totalConnections: b.totalConnections,
+            priority: b.config.priority,
+        }));
+        return c.json({
+            status: status.shuttingDown ? "shutting_down" : "ok",
+            activeSessions: status.activeSessions,
+            queueSize: status.queueSize,
+            strategy: status.strategy,
+            providers,
+            ...(pool ? { pool: pool.getStatus() } : {}),
+        });
+    });
+    app.get("/v1/sessions", (c) => {
+        const sessions = gateway.sessions.getAll().map((s) => ({
+            id: s.id,
+            providerId: s.providerId,
+            profileId: s.profileId ?? null,
+            connectedAt: new Date(s.connectedAt).toISOString(),
+            lastActivity: new Date(s.lastActivity).toISOString(),
+            durationMs: Date.now() - s.connectedAt,
+            messageCount: s.messageCount,
+        }));
+        return c.json({
+            count: sessions.length,
+            sessions,
+        });
+    });
+    app.get("/v1/sessions/parked", (c) => {
+        if (!reconnectRegistry)
+            return c.json({ count: 0, parked: [] });
+        const ttlMs = gateway.config.gateway.sessions?.reconnectTimeoutMs ?? 300000;
+        const parked = reconnectRegistry.getAll().map((p) => ({
+            sessionId: p.sessionId,
+            providerId: p.providerId,
+            parkedAt: new Date(p.parkedAt).toISOString(),
+            originalConnectedAt: new Date(p.originalConnectedAt).toISOString(),
+            messageCount: p.messageCount,
+            expiresAt: new Date(p.parkedAt + ttlMs).toISOString(),
+        }));
+        return c.json({ count: parked.length, parked });
+    });
+    const STRATEGIES = ["priority-chain", "round-robin", "least-connections", "latency-optimized", "weighted"];
+    app.put("/v1/config/strategy", async (c) => {
+        const body = (await c.req.json().catch(() => ({})));
+        const strategy = body.strategy;
+        if (!strategy || !STRATEGIES.includes(strategy)) {
+            return c.json({ error: "Invalid routing strategy", allowed: STRATEGIES }, 400);
+        }
+        const previous = gateway.config.gateway.defaultStrategy;
+        gateway.config.gateway.defaultStrategy = strategy;
+        gateway.selector.setStrategy(strategy);
+        const failed = persistConfigOrRollback(gateway.config, () => {
+            gateway.config.gateway.defaultStrategy = previous;
+            gateway.selector.setStrategy(previous);
+        });
+        if (failed)
+            return c.json(failed, 500);
+        return c.json({ ok: true, strategy });
+    });
+    const redactWebhookUrl = (url) => url.replace(/([?&])(token|apiKey|key|secret|password)=[^&]*/gi, "$1$2=***");
+    app.get("/v1/webhooks", (c) => {
+        const webhooks = gateway.config.webhooks.map((w, index) => ({
+            index,
+            url: redactWebhookUrl(w.url),
+            events: w.events ?? null,
+        }));
+        return c.json({ webhooks });
+    });
+    const readWebhookBody = async (c) => {
+        const body = (await c.req.json().catch(() => ({})));
+        return parseWebhookBody(body);
+    };
+    const resolveWebhookIndex = (raw) => {
+        const n = Number(raw);
+        return Number.isInteger(n) && n >= 0 && n < gateway.config.webhooks.length ? n : null;
+    };
+    app.post("/v1/webhooks", async (c) => {
+        const parsed = await readWebhookBody(c);
+        if (parsed.errors)
+            return c.json({ error: "Invalid webhook", details: parsed.errors }, 400);
+        gateway.config.webhooks.push(parsed.data);
+        const failed = persistConfigOrRollback(gateway.config, () => gateway.config.webhooks.pop());
+        if (failed)
+            return c.json(failed, 500);
+        return c.json({ ok: true, index: gateway.config.webhooks.length - 1 }, 201);
+    });
+    app.put("/v1/webhooks/:index", async (c) => {
+        const index = resolveWebhookIndex(c.req.param("index"));
+        if (index === null)
+            return c.json({ error: "Webhook not found" }, 404);
+        const parsed = await readWebhookBody(c);
+        if (parsed.errors)
+            return c.json({ error: "Invalid webhook", details: parsed.errors }, 400);
+        const previous = gateway.config.webhooks[index];
+        gateway.config.webhooks[index] = parsed.data;
+        const failed = persistConfigOrRollback(gateway.config, () => { gateway.config.webhooks[index] = previous; });
+        if (failed)
+            return c.json(failed, 500);
+        return c.json({ ok: true });
+    });
+    app.delete("/v1/webhooks/:index", (c) => {
+        const index = resolveWebhookIndex(c.req.param("index"));
+        if (index === null)
+            return c.json({ error: "Webhook not found" }, 404);
+        const [removed] = gateway.config.webhooks.splice(index, 1);
+        const failed = persistConfigOrRollback(gateway.config, () => gateway.config.webhooks.splice(index, 0, removed));
+        if (failed)
+            return c.json(failed, 500);
+        return c.json({ ok: true });
+    });
+    app.post("/v1/webhooks/test", async (c) => {
+        const body = (await c.req.json().catch(() => ({})));
+        const url = body.url;
+        if (!url)
+            return c.json({ error: "url required" }, 400);
+        const payload = {
+            version: "1",
+            timestamp: new Date().toISOString(),
+            event: "test",
+            status: "firing",
+            source: "browser-gateway",
+            data: {},
+        };
+        const start = Date.now();
+        try {
+            const res = await fetch(url, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+                signal: AbortSignal.timeout(5000),
+            });
+            return c.json({ ok: res.ok, status: res.status, latencyMs: Date.now() - start });
+        }
+        catch (err) {
+            return c.json({ ok: false, error: err instanceof Error ? err.message : String(err), latencyMs: Date.now() - start });
+        }
+    });
+    if (pool) {
+        const restLogger = logger ?? gateway.logger;
+        const restRoutes = createRestRoutes(pool, gateway, restLogger, profile?.lifecycle);
+        app.route("/v1", restRoutes);
+    }
+    if (profile) {
+        const profileLogger = logger ?? gateway.logger;
+        const profileRoutes = createProfileRoutes({
+            store: profile.store,
+            dekByVersion: profile.dekByVersion,
+            logger: profileLogger,
+            config: gateway.config,
+        });
+        app.route("/v1", profileRoutes);
+    }
+    else {
+        app.route("/v1", createDisabledProfileRoutes({
+            config: gateway.config,
+            bootstrapError: profileBootstrapError,
+        }));
+    }
+    if (replayStore && dataDir) {
+        const replayLogger = logger ?? gateway.logger;
+        app.route("/v1", createReplayRoutes({
+            store: replayStore,
+            logger: replayLogger,
+            config: gateway.config,
+            dataDir,
+        }));
+    }
+    // Provider CRUD endpoints
+    app.get("/v1/providers", (c) => {
+        const providers = Object.entries(gateway.config.providers).map(([id, p]) => {
+            const state = gateway.registry.get(id);
+            return {
+                id,
+                url: p.url.replace(/([?&])(token|apiKey|key|secret|password)=[^&]*/gi, "$1$2=***"),
+                maxConcurrent: p.limits?.maxConcurrent ?? state?.discoveredMaxConcurrent ?? null,
+                maxConcurrentSource: p.limits?.maxConcurrent
+                    ? "config"
+                    : state?.discoveredMaxConcurrent
+                        ? "discovered"
+                        : null,
+                detectedKind: state?.detectedKind ?? null,
+                priority: p.priority,
+                weight: p.weight ?? 1,
+                profile: p.profile ?? null,
+                multiProfile: p.multiProfile || state?.detectedKind === "browserserve" || false,
+                headers: p.headers ?? null,
+            };
+        });
+        return c.json({ providers });
+    });
+    app.post("/v1/providers/probe", async (c) => {
+        const body = await c.req.json().catch(() => ({}));
+        const url = typeof body.url === "string" ? body.url : "";
+        if (!url)
+            return c.json({ error: "url is required" }, 400);
+        try {
+            const caps = await probeProviderCapabilities(url, {
+                perStepTimeoutMs: 2_000,
+                totalTimeoutMs: 5_000,
+            });
+            return c.json({
+                detectedKind: caps.providerKind,
+                advertisedMaxConcurrent: caps.advertisedMaxConcurrent,
+            });
+        }
+        catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
+            return c.json({ error: reason }, 200);
+        }
+    });
+    app.post("/v1/providers", async (c) => {
+        const body = await c.req.json().catch(() => ({}));
+        const id = body.id;
+        if (!id || !body.url) {
+            return c.json({ error: "Missing required fields: id, url" }, 400);
+        }
+        if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+            return c.json({ error: "Provider ID must be alphanumeric with hyphens/underscores only" }, 400);
+        }
+        if (gateway.config.providers[id]) {
+            return c.json({ error: `Provider '${id}' already exists` }, 409);
+        }
+        const parsed = parseProviderConfigBody(body);
+        if (parsed.errors) {
+            return c.json({ error: "Invalid provider config", details: parsed.errors }, 400);
+        }
+        if (parsed.data.multiProfile === true) {
+            const caps = await probeProviderCapabilities(parsed.data.url, {
+                perStepTimeoutMs: 5_000,
+                totalTimeoutMs: 15_000,
+            });
+            if (caps.providerKind !== "browserserve") {
+                return c.json({
+                    error: "multiProfile:true is only valid on browserserve providers",
+                    details: [
+                        "The probe reached this upstream but it did not identify as browserserve.",
+                        "Remove `multiProfile: true` from this provider, or point at a browserserve instance.",
+                        "External providers can only serve profile sessions with a `profile: \"<name>\"` pin (one slot per profile).",
+                    ],
+                }, 400);
+            }
+        }
+        gateway.config.providers[id] = parsed.data;
+        gateway.registry.register(id, parsed.data);
+        try {
+            writeConfig(gateway.config);
+        }
+        catch (err) {
+            // Roll back the in-memory add so the API call is atomic — otherwise a
+            // failed disk write leaves the gateway with a provider that won't
+            // survive restart, and the dashboard's success-vs-error path forks.
+            delete gateway.config.providers[id];
+            gateway.registry.remove(id);
+            const reason = err instanceof Error ? err.message : String(err);
+            return c.json({
+                error: "Cannot persist provider to disk",
+                details: [reason, "Set BG_DATA_DIR to a writable path (e.g. /data) or mount gateway.yml with write permission."],
+            }, 500);
+        }
+        return c.json({ ok: true, id }, 201);
+    });
+    app.put("/v1/providers/:id", async (c) => {
+        const id = c.req.param("id");
+        const existing = gateway.config.providers[id];
+        if (!existing) {
+            return c.json({ error: `Provider '${id}' not found` }, 404);
+        }
+        const body = await c.req.json().catch(() => ({}));
+        const parsed = parseProviderConfigBody(body, existing);
+        if (parsed.errors) {
+            return c.json({ error: "Invalid provider config", details: parsed.errors }, 400);
+        }
+        gateway.config.providers[id] = parsed.data;
+        const state = gateway.registry.get(id);
+        if (state) {
+            state.config = parsed.data;
+        }
+        try {
+            writeConfig(gateway.config);
+        }
+        catch {
+            return c.json({ error: "Provider updated but failed to save config file" }, 500);
+        }
+        return c.json({ ok: true, id });
+    });
+    app.delete("/v1/providers/:id", (c) => {
+        const id = c.req.param("id");
+        if (!gateway.config.providers[id]) {
+            return c.json({ error: `Provider '${id}' not found` }, 404);
+        }
+        const state = gateway.registry.get(id);
+        if (state && state.active > 0) {
+            return c.json({ error: `Provider '${id}' has ${state.active} active connections. Disconnect them first.` }, 409);
+        }
+        delete gateway.config.providers[id];
+        gateway.registry.remove(id);
+        try {
+            writeConfig(gateway.config);
+        }
+        catch {
+            return c.json({ error: "Provider removed but failed to save config file" }, 500);
+        }
+        return c.json({ ok: true, id });
+    });
+    app.post("/v1/providers/:id/test", async (c) => {
+        const id = c.req.param("id");
+        const provider = gateway.config.providers[id];
+        let url;
+        let headers;
+        if (provider) {
+            url = provider.url;
+            headers = provider.headers;
+        }
+        else {
+            const body = await c.req.json().catch(() => ({}));
+            url = body.url;
+            if (!url)
+                return c.json({ error: "Provider not found and no URL provided" }, 400);
+            if (body.headers && typeof body.headers === "object" && !Array.isArray(body.headers)) {
+                const entries = Object.entries(body.headers).filter(([k, v]) => typeof k === "string" && typeof v === "string" && k && v);
+                if (entries.length > 0)
+                    headers = Object.fromEntries(entries);
+            }
+        }
+        const start = Date.now();
+        try {
+            if (isHttpUrl(url)) {
+                const data = await fetchCdpVersion(url, 5000);
+                return c.json({
+                    ok: true,
+                    latencyMs: Date.now() - start,
+                    browser: data.browser,
+                    wsUrl: data.webSocketDebuggerUrl,
+                });
+            }
+            await probeWebSocket(url, 5000, headers);
+            return c.json({ ok: true, latencyMs: Date.now() - start });
+        }
+        catch (err) {
+            return c.json({ ok: false, error: err.message, latencyMs: Date.now() - start });
+        }
+    });
+    app.get("/v1/providers/:id/capabilities", (c) => {
+        const id = c.req.param("id");
+        if (!gateway.config.providers[id]) {
+            return c.json({ error: `Provider '${id}' not found` }, 404);
+        }
+        const record = gateway.registry.getCapabilityRecord(id);
+        return c.json({
+            id,
+            status: record?.status ?? "pending",
+            capabilities: record?.capabilities ?? null,
+        });
+    });
+    app.post("/v1/providers/:id/capabilities/revalidate", async (c) => {
+        const id = c.req.param("id");
+        if (!gateway.config.providers[id]) {
+            return c.json({ error: `Provider '${id}' not found` }, 404);
+        }
+        await gateway.registry.probe(id);
+        const record = gateway.registry.getCapabilityRecord(id);
+        return c.json({
+            id,
+            status: record?.status ?? "failed",
+            capabilities: record?.capabilities ?? null,
+        });
+    });
+    // ─────────────────────────────────────────────────────────────────────
+    // Browser launch endpoint.
+    //
+    // `POST /v1/browser/launch` verifies (and, if missing, registers) a
+    // CloakBrowser / external CDP provider, then returns its live CDP URL
+    // alongside the gateway connect URL so a client can drive the launched
+    // browser through the gateway. The CDP URL is resolved, in order, from:
+    //   1. the request body `cdpUrl`
+    //   2. the `BG_CLOAKBROWSER_CDP_URL` env var
+    //   3. an already-registered provider named `cloakbrowser`
+    //
+    // On Railway the standalone CloakBrowser service is always running, so
+    // "launch" here means "make sure it's live and routable through me".
+    // `GET /v1/browser/launch` is a read-only variant that reports the current
+    // state without mutating provider config.
+    const LAUNCH_PROVIDER_ID = process.env.BG_LAUNCH_PROVIDER_ID ?? "cloakbrowser";
+    async function resolveLaunchCdpUrl(body) {
+        if (body?.cdpUrl && typeof body.cdpUrl === "string")
+            return body.cdpUrl;
+        const fromEnv = process.env.BG_CLOAKBROWSER_CDP_URL;
+        if (fromEnv)
+            return fromEnv;
+        const existing = gateway.config.providers[LAUNCH_PROVIDER_ID];
+        if (existing)
+            return existing.url;
+        return null;
+    }
+    async function probeCdp(url) {
+        if (!isHttpUrl(url)) {
+            // ws/wss providers: probe the websocket directly.
+            await probeWebSocket(url, 5000);
+            return { browser: null, wsUrl: null };
+        }
+        const data = await fetchCdpVersion(url, 5000);
+        return { browser: data.browser ?? null, wsUrl: data.webSocketDebuggerUrl ?? null };
+    }
+    app.get("/v1/browser/launch", async (c) => {
+        const url = await resolveLaunchCdpUrl();
+        if (!url) {
+            return c.json({
+                ok: false,
+                error: "No CloakBrowser CDP URL configured. Set BG_CLOAKBROWSER_CDP_URL or POST {\"cdpUrl\":\"...\"}.",
+            }, 404);
+        }
+        const start = Date.now();
+        try {
+            const probe = await probeCdp(url);
+            const registered = !!gateway.config.providers[LAUNCH_PROVIDER_ID];
+            const host = getEffectiveHost(c);
+            const protocol = getEffectiveProtocol(c) === "https" ? "wss" : "ws";
+            const tokenParam = c.req.query("token");
+            const connectUrl = `${protocol}://${host}/v1/connect${tokenParam ? `?token=${tokenParam}` : ""}`;
+            return c.json({
+                ok: true,
+                providerId: LAUNCH_PROVIDER_ID,
+                registered,
+                cdpUrl: url,
+                browser: probe.browser,
+                latencyMs: Date.now() - start,
+                gatewayConnectUrl: connectUrl,
+                gatewayHttpUrl: `${getEffectiveProtocol(c)}://${host}`,
+            });
+        }
+        catch (err) {
+            return c.json({ ok: false, cdpUrl: url, error: err.message, latencyMs: Date.now() - start }, 502);
+        }
+    });
+    app.post("/v1/browser/launch", async (c) => {
+        const body = await c.req.json().catch(() => ({}));
+        const url = await resolveLaunchCdpUrl(body);
+        if (!url) {
+            return c.json({
+                ok: false,
+                error: "No CloakBrowser CDP URL provided. Send {\"cdpUrl\":\"http://...\"} or set BG_CLOAKBROWSER_CDP_URL.",
+            }, 400);
+        }
+        const start = Date.now();
+        // 1. Verify the browser is actually live over CDP.
+        let probe;
+        try {
+            probe = await probeCdp(url);
+        }
+        catch (err) {
+            return c.json({ ok: false, cdpUrl: url, error: `CloakBrowser not reachable: ${err.message}`, latencyMs: Date.now() - start }, 502);
+        }
+        // 2. Register as a provider if missing, or refresh its URL if changed.
+        const existing = gateway.config.providers[LAUNCH_PROVIDER_ID];
+        const profilePin = typeof body.profile === "string" ? body.profile : undefined;
+        const maxConcurrent = typeof body.maxConcurrent === "number" ? body.maxConcurrent : undefined;
+        if (!existing) {
+            const candidate = {
+                url,
+                limits: maxConcurrent !== undefined ? { maxConcurrent } : undefined,
+                priority: 1,
+                weight: 1,
+                profile: profilePin,
+                multiProfile: false,
+                headers: undefined,
+            };
+            const parsed = parseProviderConfigBody(candidate);
+            if (parsed.errors) {
+                return c.json({ ok: false, error: "Invalid provider config", details: parsed.errors }, 400);
+            }
+            gateway.config.providers[LAUNCH_PROVIDER_ID] = parsed.data;
+            gateway.registry.register(LAUNCH_PROVIDER_ID, parsed.data);
+            try {
+                writeConfig(gateway.config);
+            }
+            catch (err) {
+                // Best-effort: keep the in-memory registration so this call still
+                // succeeds; the provider just won't survive a restart.
+                logger?.warn?.({ err }, "browser/launch: failed to persist provider to disk");
+            }
+        }
+        else if (existing.url !== url || (profilePin && existing.profile !== profilePin)) {
+            const updated = {
+                ...existing,
+                url,
+                profile: profilePin ?? existing.profile,
+                limits: maxConcurrent !== undefined ? { maxConcurrent } : existing.limits,
+            };
+            gateway.config.providers[LAUNCH_PROVIDER_ID] = updated;
+            const state = gateway.registry.get(LAUNCH_PROVIDER_ID);
+            if (state)
+                state.config = updated;
+            try {
+                writeConfig(gateway.config);
+            }
+            catch (err) {
+                logger?.warn?.({ err }, "browser/launch: failed to persist provider update to disk");
+            }
+        }
+        const host = getEffectiveHost(c);
+        const protocol = getEffectiveProtocol(c) === "https" ? "wss" : "ws";
+        const tokenParam = c.req.query("token");
+        const connectUrl = `${protocol}://${host}/v1/connect${tokenParam ? `?token=${tokenParam}` : ""}`;
+        return c.json({
+            ok: true,
+            providerId: LAUNCH_PROVIDER_ID,
+            registered: true,
+            cdpUrl: url,
+            browser: probe.browser,
+            latencyMs: Date.now() - start,
+            gatewayConnectUrl: connectUrl,
+            gatewayHttpUrl: `${getEffectiveProtocol(c)}://${host}`,
+            profile: profilePin ?? existing?.profile ?? null,
+        });
+    });
+    // Config editor endpoints. Raw YAML reveals provider tokens, so the
+    // unredacted view is gated behind the dashboard cookie session — Bearer
+    // callers get a redacted copy with `token=`, `apikey=`, etc. masked.
+    app.get("/v1/config", (c) => {
+        const path = loadedConfigPath;
+        if (!path || !existsSync(path)) {
+            return c.json({ yaml: "", path: null, exists: false });
+        }
+        const yaml = readFileSync(path, "utf-8");
+        const cookie = getCookie(c.req.header("cookie"), COOKIE_NAME);
+        const cookieAuth = !!(token && cookie && verifySession(cookie, sessionSecret));
+        return c.json({
+            yaml: cookieAuth ? yaml : redactProviderUrlsInYaml(yaml),
+            path,
+            exists: true,
+            redacted: !cookieAuth,
+        });
+    });
+    app.post("/v1/config/validate", bodyLimit({ maxSize: MAX_CONFIG_YAML_BYTES }), async (c) => {
+        const body = await c.req.json().catch(() => ({}));
+        const yaml = body.yaml;
+        if (!yaml)
+            return c.json({ valid: false, errors: ["No YAML content provided"] });
+        const result = await parseYamlGatewayConfig(yaml);
+        if (result.kind === "parse-error") {
+            return c.json({ valid: false, errors: [`YAML parse error: ${result.message}`] });
+        }
+        if (result.kind === "validation-error") {
+            return c.json({ valid: false, errors: result.errors });
+        }
+        return c.json({ valid: true, providerCount: Object.keys(result.data.providers).length });
+    });
+    app.put("/v1/config", bodyLimit({ maxSize: MAX_CONFIG_YAML_BYTES }), async (c) => {
+        const body = await c.req.json().catch(() => ({}));
+        const yaml = body.yaml;
+        if (!yaml)
+            return c.json({ error: "No YAML content provided" }, 400);
+        const result = await parseYamlGatewayConfig(yaml);
+        if (result.kind === "parse-error") {
+            return c.json({ error: `YAML parse error: ${result.message}` }, 400);
+        }
+        if (result.kind === "validation-error") {
+            return c.json({ error: "Invalid configuration", details: result.errors }, 400);
+        }
+        const path = loadedConfigPath ?? "./gateway.yml";
+        if (existsSync(path)) {
+            copyFileSync(path, `${path}.backup`);
+        }
+        writeFileSync(path, yaml, "utf-8");
+        return c.json({ ok: true, message: "Config saved. Restart the gateway to apply changes." });
+    });
+    if (webDir && existsSync(webDir)) {
+        app.post("/web/auth", async (c) => {
+            if (!token) {
+                return c.json({ error: "Auth not configured" }, 400);
+            }
+            const body = await c.req.json().catch(() => ({}));
+            const submitted = body.token;
+            if (!submitted || !safeTokenCompare(submitted, token)) {
+                return c.json({ error: "Invalid token" }, 401);
+            }
+            const sessionValue = signSession(sessionSecret);
+            const isSecure = getEffectiveProtocol(c) === "https";
+            const cookieParts = [
+                `${COOKIE_NAME}=${sessionValue}`,
+                `Path=/`,
+                `HttpOnly`,
+                `SameSite=Strict`,
+                `Max-Age=${SESSION_MAX_AGE}`,
+            ];
+            if (isSecure)
+                cookieParts.push("Secure");
+            c.header("Set-Cookie", cookieParts.join("; "));
+            return c.json({ ok: true });
+        });
+        app.post("/web/logout", (c) => {
+            c.header("Set-Cookie", `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`);
+            return c.json({ ok: true });
+        });
+        app.get("/web/auth/check", (c) => {
+            if (!token)
+                return c.json({ authenticated: true, authRequired: false });
+            const cookie = getCookie(c.req.header("cookie"), COOKIE_NAME);
+            const authenticated = cookie ? verifySession(cookie, sessionSecret) : false;
+            return c.json({ authenticated, authRequired: true });
+        });
+        app.get("/web", (c) => c.redirect("/web/"));
+        app.get("/web/*", (c) => {
+            const urlPath = new URL(c.req.url).pathname.replace(/^\/web/, "") || "/";
+            const tryPaths = [
+                join(webDir, urlPath),
+                join(webDir, urlPath, "index.html"),
+                join(webDir, urlPath + ".html"),
+            ];
+            for (const filePath of tryPaths) {
+                if (existsSync(filePath) && !filePath.endsWith("/")) {
+                    try {
+                        const content = readFileSync(filePath);
+                        const ext = extname(filePath);
+                        const contentType = MIME_TYPES[ext] || "application/octet-stream";
+                        return c.body(content, 200, { "Content-Type": contentType });
+                    }
+                    catch {
+                        continue;
+                    }
+                }
+            }
+            const indexPath = join(webDir, "index.html");
+            if (existsSync(indexPath)) {
+                const content = readFileSync(indexPath);
+                return c.body(content, 200, { "Content-Type": "text/html" });
+            }
+            return c.json({ error: "Not found" }, 404);
+        });
+    }
+    app.notFound((c) => {
+        return c.json({
+            error: "Not found",
+            message: "WebSocket at /v1/connect, REST API at /v1/screenshot or /v1/content or /v1/scrape, dashboard at /web, status at /v1/status",
+        }, 404);
+    });
+    return app;
+}
+//# sourceMappingURL=app.js.map

@@ -1,0 +1,1 @@
+{"version":3,"file":"node.d.ts","sourceRoot":"","sources":["../../../src/server/transport/node.ts"],"names":[],"mappings":"AAIA,OAAO,KAAK,EAEV,YAAY,EACZ,WAAW,EACX,cAAc,EACf,MAAM,yBAAyB,CAAC;AAOjC;;;;;;;;;;;;;;GAcG;AACH,qBAAa,oBAAqB,YAAW,cAAc;IACzD,QAAQ,CAAC,IAAI,mBAAmB;IAE1B,KAAK,CAAC,IAAI,EAAE,YAAY,GAAG,OAAO,CAAC,WAAW,CAAC;CAsHtD"}

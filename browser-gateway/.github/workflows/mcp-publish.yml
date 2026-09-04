@@ -1,0 +1,113 @@
+name: Publish to MCP Registry
+
+# Manual-trigger publish to https://registry.modelcontextprotocol.io.
+# Mirrors the docker.yml convention — workflow_dispatch only, with a
+# version-skip check that no-ops if the version is already on the registry.
+# Uses GitHub OIDC for keyless auth, so no PAT and no token file ever touch
+# a developer laptop.
+#
+# Flow after every npm publish:
+#   GitHub → Actions → "Publish to MCP Registry" → Run workflow → Run
+#
+# The version comes from package.json on the default branch — no input
+# needed. The optional `version` input is only for backfill / explicit
+# override when you want to publish something other than what's on main.
+#
+# Background: planning/infrastructure/mcp-registry.md
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Override (leave blank to use the version in package.json)"
+        required: false
+        type: string
+      force:
+        description: "Publish even if the version is already on the MCP registry"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  REGISTRY_BASE: https://registry.modelcontextprotocol.io
+  SERVER_NAME: io.github.browser-gateway/browser-gateway
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve target version
+        id: version
+        run: |
+          INPUT="${{ inputs.version }}"
+          if [ -n "$INPUT" ]; then
+            VERSION="$INPUT"
+            SOURCE="workflow input"
+          else
+            VERSION=$(jq -r .version package.json)
+            SOURCE="package.json"
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+            echo "::error::Version must be semver (X.Y.Z[-prerelease]); got: $VERSION (from $SOURCE)"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "::notice::Publishing version $VERSION (resolved from $SOURCE)"
+
+      - name: Version check — skip if already on registry
+        id: skip_check
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ENCODED_NAME=$(printf '%s' "$SERVER_NAME" | jq -sRr @uri)
+          ENCODED_VERSION=$(printf '%s' "$VERSION" | jq -sRr @uri)
+          URL="${REGISTRY_BASE}/v0.1/servers/${ENCODED_NAME}/versions/${ENCODED_VERSION}"
+
+          HTTP_CODE=$(curl -sS -o /tmp/registry-resp.json -w "%{http_code}" "$URL" || echo "000")
+          echo "  registry check → HTTP $HTTP_CODE"
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            if [ "${{ inputs.force }}" = "true" ]; then
+              echo "::notice::Version $VERSION already on registry — force=true, continuing"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "::notice::Version $VERSION already published to the MCP registry — skipping. Set force=true to override."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "  not yet on registry, proceeding to publish"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Substitute version into server.json
+        if: steps.skip_check.outputs.skip != 'true'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' \
+            server.json > server.tmp
+          mv server.tmp server.json
+          cat server.json
+
+      - name: Install mcp-publisher
+        if: steps.skip_check.outputs.skip != 'true'
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher --help | head -5
+
+      - name: Validate server.json
+        if: steps.skip_check.outputs.skip != 'true'
+        run: ./mcp-publisher validate
+
+      - name: Authenticate via GitHub OIDC
+        if: steps.skip_check.outputs.skip != 'true'
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to MCP Registry
+        if: steps.skip_check.outputs.skip != 'true'
+        run: ./mcp-publisher publish

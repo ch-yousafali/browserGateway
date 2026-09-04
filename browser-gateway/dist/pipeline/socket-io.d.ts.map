@@ -1,0 +1,1 @@
+{"version":3,"file":"socket-io.d.ts","sourceRoot":"","sources":["../../src/pipeline/socket-io.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,cAAc,EAAE,MAAM,eAAe,CAAC;AAEpD;;wEAEwE;AACxE,wBAAgB,MAAM,CAAC,IAAI,EAAE,cAAc,EAAE,GAAG,EAAE,MAAM,EAAE,EAAE,EAAE,CAAC,IAAI,EAAE,OAAO,KAAK,IAAI,GAAG,IAAI,CAM3F;AAED;qDACqD;AACrD,wBAAgB,aAAa,CAAC,GAAG,EAAE,MAAM,GAAG,UAAU,CAKrD"}

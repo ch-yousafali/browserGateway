@@ -1,0 +1,56 @@
+version: 1
+gateway:
+  port: 9500
+  defaultStrategy: round-robin
+  connectionTimeout: 15000
+  healthCheckInterval: 30000
+  cooldown:
+    defaultMs: 10000
+    failureThreshold: 0.5
+    minRequestVolume: 3
+  sessions:
+    idleTimeoutMs: 60000
+    reconnectTimeoutMs: 60000
+providers:
+  # profiles.enabled requires at least one provider slot pinned via `profile:`.
+  # Mix here gives coverage: two pinned slots + one unpinned for stateless
+  # traffic.
+  chrome-docker-1:
+    url: http://localhost:9222
+    limits:
+      maxConcurrent: 10
+    profile: default
+  chrome-docker-2:
+    url: http://localhost:9223
+    limits:
+      maxConcurrent: 10
+    profile: test
+  chrome-docker-4:
+    url: http://localhost:9224
+    limits:
+      maxConcurrent: 10
+dashboard:
+  enabled: true
+logging:
+  level: info
+profiles:
+  enabled: true
+  store: filesystem
+  filesystem:
+    path: ./profiles
+  encryption:
+    keyEnv: BG_ENCRYPTION_KEY
+  lockTtlMs: 300000
+  cdpTimeoutMs: 10000
+  commitTimeoutMs: 4000
+replay:
+  enabled: true
+  store: filesystem
+  filesystem:
+    path: ./replays
+  retentionDays: 7
+  maxBytesPerSession: 524288000
+  capture:
+    format: png
+    quality: 80
+    everyNthFrame: 1
