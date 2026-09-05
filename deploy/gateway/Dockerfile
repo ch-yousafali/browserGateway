@@ -10,7 +10,7 @@
 # Build arg:
 #   GATEWAY_BASE — the tagged base image produced by stage 1
 #      (e.g. ghcr.io/yourorg/browser-gateway:0.4.21-railway-base)
-ARG GATEWAY_BASE=ghcr.io/browser-gateway/server:latest
+ARG GATEWAY_BASE=ghcr.io/ch-yousafali/browser-gateway:0.4.21-railway-base
 FROM ${GATEWAY_BASE}
 
 # Railway config (env-interpolated, no providers — launch endpoint registers

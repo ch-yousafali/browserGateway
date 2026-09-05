@@ -5,7 +5,7 @@
 #
 # Base image already contains: CloakBrowser (Chromium 151, stealth),
 # Xvfb, socat, and the clawbrowser runtime at /opt/clawbrowser/.
-FROM docker.io/library/cloakbrowser:151-poc-v2
+FROM ghcr.io/ch-yousafali/cloakbrowser:151-poc-v2
 
 # Persistent profile data lives here. On Railway, mount a volume at this path
 # so cookies/localStorage survive redeploys. Locally it is ephemeral.
