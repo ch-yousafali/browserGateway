@@ -10,8 +10,11 @@ DATA_DIR="${BG_DATA_DIR:-/data}"
 SEED_CONFIG="/app/gateway.railway.yml"
 mkdir -p "$DATA_DIR"
 
-# Seed config into the volume on first boot only (don't clobber edits).
-if [ ! -f "$DATA_DIR/gateway.yml" ] && [ -f "$SEED_CONFIG" ]; then
+# Always seed config into the volume. This overwrites any stale config from
+# a previous deployment (e.g. one with a bad port value). Provider edits made
+# via the dashboard API are re-saved by the gateway at runtime, so they'll be
+# re-applied on the next /v1/browser/launch call.
+if [ -f "$SEED_CONFIG" ]; then
   cp "$SEED_CONFIG" "$DATA_DIR/gateway.yml"
 fi
 

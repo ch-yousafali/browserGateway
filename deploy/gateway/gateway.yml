@@ -13,7 +13,6 @@
 #   BG_DATA_DIR         — /data (mounted volume)
 version: 1
 gateway:
-  port: ${PORT:-9500}
   defaultStrategy: round-robin
   connectionTimeout: 10000
   healthCheckInterval: 30000
@@ -30,7 +29,7 @@ dashboard:
 logging:
   level: info
 profiles:
-  enabled: true
+  enabled: false
   store: filesystem
   filesystem:
     path: ${BG_DATA_DIR}/profiles
